@@ -38,27 +38,46 @@ BBG_TICKERS: Dict[str, str] = {
     "OMO_NET": "CNNIOMO Index",
 }
 
-# Ornstein-Uhlenbeck 拟真数据校准参数 (基于历史统计矩)
-# 格式: (长期均值 mu, 均值回复速度 kappa, 波动率 sigma)
-OU_PARAMS: Dict[str, Tuple[float, float, float]] = {
-    "DR007": (2.10, 0.15, 0.35),       # 均值~2.10%, 较快均值回复
-    "NCD_1Y": (2.50, 0.05, 0.20),      # 均值~2.50%, 中等回复速度
-    "MLF_1Y": (2.75, 0.02, 0.05),      # 均值~2.75%, 政策利率变动缓慢
-    "RRR": (8.50, 0.01, 0.15),         # 均值~8.50%, 极低频调整
-    "OMO_NET": (0.0, 0.20, 500.0),     # 均值~0, 高频波动 (亿元)
+# ============================================================================
+# 结构化拟真数据参数 (Structural DGP v2 — 共享创新驱动)
+# ============================================================================
+# 核心思路: 各OU过程共享一个日频共同冲击 z_t ~ N(0,1),
+#   dX_it = kappa_i * (mu_i - X_it) * dt
+#           + lambda_i * sigma_f * z_t * sqrt(dt)    ← 共同因子
+#           + sigma_i * dW_it                        ← 特质噪声
+#
+# 差分后: ΔX_it ≈ lambda_i * sigma_f * z_t * sqrt(dt) + noise
+# DFM可直接从差分后的相关结构中提取共同因子.
+#
+# 关键: lambda_i / sigma_i 的比值决定该变量的公因子方差占比 (R²)
+
+# 共同因子冲击标准差
+FACTOR_SIGMA: float = 1.0
+
+# 各变量: (长期均值, OU回复速度, 因子载荷, 特质波动)
+STRUCTURAL_PARAMS: Dict[str, Tuple[float, float, float, float]] = {
+    #           mu     kappa  lambda  sigma_idio
+    "DR007":  (2.10,  0.15,  0.70,   0.50),   # 高因子敏感, R²≈66%
+    "NCD_1Y": (2.50,  0.05,  0.55,   0.45),   # 中高敏感, R²≈60%
+    "MLF_1Y": (2.75,  0.02,  0.35,   0.15),   # 中等敏感, R²≈84% (政策利率)
+    "RRR":    (8.50,  0.01, -0.40,   0.20),   # 反向 (宽松=降准), R²≈80%
+    "OMO_NET":(0.0,   0.20,  300.0,  350.0),  # 高载荷(亿元), R²≈42%
 }
 
 # 各指标的平稳性首选处理方式
-# "auto":   先ADF检验, 平稳→保持level, 否则自动差分 (利率类推荐)
-# "diff":   强制一阶差分 (RRR等低频阶梯式调整)
-# "zscore": 滚动Z标准化 (OMO等高波动数量型工具)
+# "auto":      先ADF检验, 平稳→保持level, 否则自动差分 (利率类推荐)
+# "diff_ema":  一阶差分 + EMA平滑 (解决RRR离散跳跃导致的稀疏尖峰问题)
+# "zscore":    滚动Z标准化 (OMO等高波动数量型工具)
 STATIONARITY_TREATMENT: Dict[str, str] = {
     "DR007": "auto",
     "NCD_1Y": "auto",
-    "MLF_1Y": "auto",
-    "RRR": "diff",
+    "MLF_1Y": "diff_ema",   # 离散政策利率, 同RRR用EMA平滑
+    "RRR": "diff_ema",
     "OMO_NET": "zscore",
 }
+
+# RRR EMA平滑半衰期 (交易日) — 将离散跳跃扩散为渐进信号
+RRR_EMA_HALFLIFE: int = 10
 
 # ADF检验显著性水平
 ADF_SIGNIFICANCE: float = 0.05
@@ -171,39 +190,49 @@ class PBOCDataEngine:
         return raw.dropna(how="all").ffill()
 
     # ------------------------------------------------------------------
-    # 拟真数据生成器 (Ornstein-Uhlenbeck)
+    # 拟真数据生成器 (结构化DGP v2: 共享创新驱动)
     # ------------------------------------------------------------------
 
     def _generate_quasi_data(self, seed: int = 42) -> pd.DataFrame:
         """
-        基于Ornstein-Uhlenbeck过程生成拟真数据
+        结构化数据生成过程 — 共享日频创新冲击
 
-        dX_t = kappa * (mu - X_t) * dt + sigma * dW_t
+        各OU过程共享一个公因子冲击 z_t, 确保差分后具有清晰的因子结构:
 
-        每个指标独立模拟, 参数从OU_PARAMS校准表读取.
-        OMO_NET额外进行滚动求和平滑以模拟实际公告累计效应.
-        MLF_1Y模拟阶梯式调整 (离散政策利率特征).
+          dX_it = kappa_i * (mu_i - X_it) * dt
+                  + lambda_i * sigma_f * z_t * sqrt(dt)   ← 共同因子
+                  + sigma_i * sqrt(dt) * eps_it            ← 特质噪声
+
+        差分后:
+          ΔX_it ≈ lambda_i * sigma_f * z_t * sqrt(dt) + sigma_i * sqrt(dt) * eps_it
+
+        公因子方差占比 R²_i ≈ lambda_i² / (lambda_i² + sigma_i²)
         """
         rng = np.random.default_rng(seed)
         dates = pd.bdate_range(start=self.start_date, end=self.end_date)
         n = len(dates)
-        dt = 1.0 / 252.0  # 日频时间步长
+        dt = 1.0 / 252.0
+        sqrt_dt = np.sqrt(dt)
+
+        # 共同因子冲击序列 z_t ~ N(0,1)
+        z = rng.normal(0, 1, n)
 
         data = {}
-        for name, (mu, kappa, sigma) in OU_PARAMS.items():
+        for name, (mu, kappa, lam, sigma_idio) in STRUCTURAL_PARAMS.items():
             x = np.zeros(n)
-            x[0] = mu + rng.normal(0, sigma * 0.1)
+            x[0] = mu
 
             for t in range(1, n):
-                dx = kappa * (mu - x[t - 1]) * dt + sigma * np.sqrt(dt) * rng.normal()
-                x[t] = x[t - 1] + dx
+                # OU均值回复 + 共同因子冲击 + 特质噪声
+                drift = kappa * (mu - x[t - 1]) * dt
+                factor_shock = lam * FACTOR_SIGMA * z[t] * sqrt_dt
+                idio_shock = sigma_idio * sqrt_dt * rng.normal()
+                x[t] = x[t - 1] + drift + factor_shock + idio_shock
 
-            # MLF: 量化为5bp阶梯 (模拟政策利率离散调整)
+            # 离散化: 政策利率与准备金率为阶梯式调整
             if name == "MLF_1Y":
                 x = np.round(x * 200) / 200  # 5bp grid
-
-            # RRR: 量化为25bp阶梯
-            if name == "RRR":
+            elif name == "RRR":
                 x = np.round(x * 40) / 40  # 25bp grid
 
             data[name] = x
@@ -211,7 +240,7 @@ class PBOCDataEngine:
         df = pd.DataFrame(data, index=dates)
         df.index.name = "date"
 
-        # OMO: 滚动求和平滑
+        # OMO: 滚动求和平滑 (模拟公告累计效应)
         df["OMO_NET"] = (
             df["OMO_NET"]
             .rolling(window=self.omo_rolling_window, min_periods=1)
@@ -246,6 +275,16 @@ class PBOCDataEngine:
             if treatment == "diff":
                 processed[col] = series.diff()
                 self.stationarity_log[col] = "diff (强制一阶差分)"
+
+            elif treatment == "diff_ema":
+                # 一阶差分 + EMA平滑: 解决RRR等离散跳跃的稀疏尖峰问题
+                # 原始ΔRRR几乎全零偶发±25bp → 峰度极高 → 主导MLE
+                # EMA将跳跃扩散为渐进信号, 使其与连续变量量级可比
+                diffed = series.diff()
+                processed[col] = diffed.ewm(halflife=RRR_EMA_HALFLIFE).mean()
+                self.stationarity_log[col] = (
+                    f"diff_ema (一阶差分 + EMA平滑, 半衰期={RRR_EMA_HALFLIFE}日)"
+                )
 
             elif treatment == "zscore":
                 roll_mean = series.rolling(60, min_periods=20).mean()
@@ -358,9 +397,10 @@ class BenchmarkDataEngine:
         "CGB_10Y": "GCNY10YR Index",
     }
 
-    OU_BENCHMARK_PARAMS = {
-        "IRS_1Y": (2.30, 0.08, 0.25),
-        "CGB_10Y": (2.85, 0.04, 0.15),
+    # (长期均值, kappa, 因子载荷, 特质波动) — 与PBOC因子共享创新
+    STRUCTURAL_BENCHMARK_PARAMS = {
+        "IRS_1Y": (2.30, 0.06, 0.40, 0.35),   # 与政策利率中等相关
+        "CGB_10Y": (2.85, 0.03, 0.25, 0.30),  # 与政策利率弱相关
     }
 
     def __init__(
@@ -399,19 +439,31 @@ class BenchmarkDataEngine:
         return result.dropna(how="all").ffill()
 
     def _generate_quasi(self, seed: int) -> pd.DataFrame:
-        """Ornstein-Uhlenbeck拟真基准利率"""
+        """
+        结构化拟真基准利率 — 与PBOC工具共享同一日频创新冲击 z_t
+
+        复现与PBOCDataEngine相同的种子(seed=42)以获取相同的 z_t 序列,
+        确保基准利率与政策工具在拟真数据中具有合理的相关结构.
+        """
         rng = np.random.default_rng(seed)
         dates = pd.bdate_range(self.start_date, self.end_date)
         n = len(dates)
         dt = 1.0 / 252.0
+        sqrt_dt = np.sqrt(dt)
+
+        # 复现与PBOCDataEngine相同的共同冲击序列 z_t
+        rng_common = np.random.default_rng(42)
+        z = rng_common.normal(0, 1, n)
 
         data = {}
-        for name, (mu, kappa, sigma) in self.OU_BENCHMARK_PARAMS.items():
+        for name, (mu, kappa, lam, sigma_idio) in self.STRUCTURAL_BENCHMARK_PARAMS.items():
             x = np.zeros(n)
             x[0] = mu
             for t in range(1, n):
-                dx = kappa * (mu - x[t - 1]) * dt + sigma * np.sqrt(dt) * rng.normal()
-                x[t] = x[t - 1] + dx
+                drift = kappa * (mu - x[t - 1]) * dt
+                factor_shock = lam * FACTOR_SIGMA * z[t] * sqrt_dt
+                idio_shock = sigma_idio * sqrt_dt * rng.normal()
+                x[t] = x[t - 1] + drift + factor_shock + idio_shock
             data[name] = x
 
         df = pd.DataFrame(data, index=dates)
