@@ -158,15 +158,15 @@ class PBOCDynamicFactorModel:
         try:
             init_res = self._model.fit(
                 method="em", maxiter=50, disp=False,
-                return_params=True,
             )
+            init_params = init_res.params
         except Exception:
-            init_res = None
+            init_params = None
 
         # 主优化: EM初始化后用L-BFGS-B精细化
         fit_kwargs = dict(maxiter=maxiter, disp=disp)
-        if init_res is not None:
-            fit_kwargs["start_params"] = init_res
+        if init_params is not None:
+            fit_kwargs["start_params"] = init_params
 
         try:
             self._fit_result = self._model.fit(
