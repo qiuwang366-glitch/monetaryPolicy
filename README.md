@@ -38,10 +38,10 @@
 
 | 指标 | Bloomberg Ticker | 类型 | 平稳性处理 | 说明 |
 |:---|:---|:---:|:---:|:---|
-| **DR007** | `CNFR007 Index` | 价格型 | Level | 银行间 7 天回购加权利率 |
-| **1Y NCD** | `CNAA1Y Index` | 价格型 | Level | 1 年期同业存单收益率 |
-| **1Y MLF** | `CHLR12M Index` | 价格型 | Level | 1 年期中期借贷便利利率 |
-| **RRR** | `CHRRRP Index` | 数量型 | Δ (一阶差分) | 法定存款准备金率 |
+| **DR007** | `CNFR007 Index` | 价格型 | **自适应** (ADF→差分) | 银行间 7 天回购加权利率 |
+| **1Y NCD** | `CNAA1Y Index` | 价格型 | **自适应** (ADF→差分) | 1 年期同业存单收益率 |
+| **1Y MLF** | `CHLR12M Index` | 价格型 | **自适应** (ADF→差分) | 1 年期中期借贷便利利率 |
+| **RRR** | `CHRRRP Index` | 数量型 | 强制 Δ (一阶差分) | 法定存款准备金率 |
 | **OMO 净投放** | `CNNIOMO Index` | 数量型 | Z-score (滚动 60 日) | 公开市场净投放 (20 日滚动累计) |
 
 ### Alpha 验证基准
@@ -118,8 +118,8 @@ engine = PBOCDataEngine(force_mock=True)
 │  1. 数据获取                                              │
 │     Bloomberg (xbbg) ──失败──→ OU 拟真数据                 │
 │     ↓                                                    │
-│  2. 平稳性检验 & 预处理                                    │
-│     ADF 单位根 → Level / Δ / Z-score                      │
+│  2. 自适应平稳性处理                                       │
+│     ADF 检验 → 平稳保Level / 否则Δ / 仍不平稳Δ² / Z-score   │
 │     ↓                                                    │
 │  3. DFM 估计 (Kalman 滤波)                                │
 │     MLE (L-BFGS-B / Powell) → F_t, Λ, Φ                  │
