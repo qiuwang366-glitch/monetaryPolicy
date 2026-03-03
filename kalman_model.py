@@ -75,6 +75,7 @@ class PBOCDynamicFactorModel:
         data: pd.DataFrame,
         k_factors: int = 1,
         factor_order: int = 1,
+        error_order: int = 1,
         standardize: bool = True,
     ):
         """
@@ -86,12 +87,17 @@ class PBOCDynamicFactorModel:
             潜在因子数量, 默认1 (单因子)
         factor_order : int
             因子VAR阶数 (AR(p)中的p), 默认1
+        error_order : int
+            特质噪声AR阶数, 默认1.
+            允许 ε_it = ρ_i * ε_{i,t-1} + v_it,
+            缓解Ljung-Box残差自相关问题.
         standardize : bool
             是否对输入数据标准化 (推荐, 便于载荷系数可比)
         """
         self.raw_data = data.copy()
         self.k_factors = k_factors
         self.factor_order = factor_order
+        self.error_order = error_order
         self.standardize = standardize
 
         # 标准化参数 (反标准化用)
@@ -145,21 +151,31 @@ class PBOCDynamicFactorModel:
             endog=self.data,
             k_factors=self.k_factors,
             factor_order=self.factor_order,
+            error_order=self.error_order,
         )
 
-        # 尝试多种优化策略, 确保收敛
+        # EM初始化 (比随机初始化更稳定, 尤其对多参数模型)
+        try:
+            init_res = self._model.fit(
+                method="em", maxiter=50, disp=False,
+                return_params=True,
+            )
+        except Exception:
+            init_res = None
+
+        # 主优化: EM初始化后用L-BFGS-B精细化
+        fit_kwargs = dict(maxiter=maxiter, disp=disp)
+        if init_res is not None:
+            fit_kwargs["start_params"] = init_res
+
         try:
             self._fit_result = self._model.fit(
-                maxiter=maxiter,
-                disp=disp,
-                method="lbfgs",
+                method="lbfgs", **fit_kwargs,
             )
         except Exception:
             logger.warning("L-BFGS-B未收敛, 切换至Powell优化器")
             self._fit_result = self._model.fit(
-                maxiter=maxiter * 2,
-                disp=disp,
-                method="powell",
+                method="powell", **fit_kwargs,
             )
 
         return self._extract_results()
