@@ -48,15 +48,20 @@ OU_PARAMS: Dict[str, Tuple[float, float, float]] = {
     "OMO_NET": (0.0, 0.20, 500.0),     # 均值~0, 高频波动 (亿元)
 }
 
-# 各指标的平稳性处理方式
-# "level": 保持原序列 (利率类), "diff": 一阶差分 (数量类), "zscore": Z标准化
+# 各指标的平稳性首选处理方式
+# "auto":   先ADF检验, 平稳→保持level, 否则自动差分 (利率类推荐)
+# "diff":   强制一阶差分 (RRR等低频阶梯式调整)
+# "zscore": 滚动Z标准化 (OMO等高波动数量型工具)
 STATIONARITY_TREATMENT: Dict[str, str] = {
-    "DR007": "level",
-    "NCD_1Y": "level",
-    "MLF_1Y": "level",
+    "DR007": "auto",
+    "NCD_1Y": "auto",
+    "MLF_1Y": "auto",
     "RRR": "diff",
     "OMO_NET": "zscore",
 }
+
+# ADF检验显著性水平
+ADF_SIGNIFICANCE: float = 0.05
 
 
 # ============================================================================
@@ -221,26 +226,79 @@ class PBOCDataEngine:
 
     def _apply_stationarity(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        对各指标执行平稳性处理:
-          - "level": 保持原值 (利率类, 通常I(0)或近I(0))
-          - "diff":  一阶差分 (RRR等低频调整的数量型工具)
-          - "zscore": 滚动Z标准化 (OMO净投放等高波动数量型工具)
+        对各指标执行自适应平稳性处理:
+          - "auto":   ADF检验 → 平稳保level, 否则差分, 仍不平稳则二阶差分
+          - "diff":   强制一阶差分
+          - "zscore": 滚动Z标准化
+          - "level":  强制保持原值 (不推荐, 仅供覆盖)
+
+        每列的实际处理方式记录在 self.stationarity_log 中.
         """
+        from statsmodels.tsa.stattools import adfuller
+
         processed = pd.DataFrame(index=df.index)
+        self.stationarity_log: Dict[str, str] = {}
 
         for col in df.columns:
-            treatment = STATIONARITY_TREATMENT.get(col, "level")
+            treatment = STATIONARITY_TREATMENT.get(col, "auto")
             series = df[col].copy()
 
             if treatment == "diff":
                 processed[col] = series.diff()
+                self.stationarity_log[col] = "diff (强制一阶差分)"
+
             elif treatment == "zscore":
                 roll_mean = series.rolling(60, min_periods=20).mean()
                 roll_std = series.rolling(60, min_periods=20).std()
                 roll_std = roll_std.replace(0, np.nan)
                 processed[col] = (series - roll_mean) / roll_std
-            else:  # level
+                self.stationarity_log[col] = "zscore (滚动Z标准化)"
+
+            elif treatment == "level":
                 processed[col] = series
+                self.stationarity_log[col] = "level (强制保持原值)"
+
+            else:  # auto — 自适应策略
+                clean = series.dropna()
+                # 第一步: 检验原序列
+                try:
+                    adf_p = adfuller(clean, autolag="AIC")[1]
+                except Exception:
+                    adf_p = 1.0
+
+                if adf_p < ADF_SIGNIFICANCE:
+                    processed[col] = series
+                    self.stationarity_log[col] = f"level (ADF p={adf_p:.4f}, 原序列平稳)"
+                    continue
+
+                # 第二步: 一阶差分后检验
+                diff1 = series.diff().dropna()
+                try:
+                    adf_p1 = adfuller(diff1, autolag="AIC")[1]
+                except Exception:
+                    adf_p1 = 1.0
+
+                if adf_p1 < ADF_SIGNIFICANCE:
+                    processed[col] = series.diff()
+                    self.stationarity_log[col] = (
+                        f"diff (原序列ADF p={adf_p:.4f} 非平稳 → "
+                        f"一阶差分后 p={adf_p1:.4f}, 平稳)"
+                    )
+                    continue
+
+                # 第三步: 二阶差分 (极端情况兜底)
+                diff2 = series.diff().diff().dropna()
+                try:
+                    adf_p2 = adfuller(diff2, autolag="AIC")[1]
+                except Exception:
+                    adf_p2 = 1.0
+                processed[col] = series.diff().diff()
+                self.stationarity_log[col] = (
+                    f"diff2 (一阶差分ADF p={adf_p1:.4f} 仍非平稳 → "
+                    f"二阶差分 p={adf_p2:.4f})"
+                )
+
+            logger.info(f"  {col}: {self.stationarity_log[col]}")
 
         return processed.dropna()
 
