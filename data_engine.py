@@ -99,7 +99,7 @@ class PBOCDataEngine:
     def __init__(
         self,
         start_date: str = "2018-01-01",
-        end_date: str = "2025-12-31",
+        end_date: str = "2026-02-28",
         omo_rolling_window: int = 20,
         force_mock: bool = False,
     ):
